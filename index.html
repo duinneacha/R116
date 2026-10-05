@@ -1,0 +1,425 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <title>R116 deliveries</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=Source+Sans+3:wght@420;620&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css">
+  <style>
+    :root {
+      --ink: #1c2430;
+      --paper: #f3f5f4;
+      --line: #d5dbd8;
+      --path: #123a73;
+      --here: #0b6b4a;
+    }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; height: 100%; }
+    body {
+      min-height: 100dvh;
+      display: grid;
+      grid-template-rows: auto minmax(0, 1fr) auto;
+      background: var(--paper);
+      color: var(--ink);
+      font-family: "Source Sans 3", "Segoe UI", sans-serif;
+    }
+    header, footer {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+      padding: 10px 14px;
+      background: var(--paper);
+    }
+    header { border-bottom: 1px solid var(--line); }
+    footer {
+      flex-wrap: wrap;
+      border-top: 1px solid var(--line);
+      padding-bottom: calc(10px + env(safe-area-inset-bottom));
+    }
+    #status { flex: 1 1 140px; text-align: center; }
+    h1 {
+      margin: 0;
+      font-size: 1.25rem;
+      font-weight: 620;
+    }
+    #left {
+      margin: 0;
+      font-size: 1.15rem;
+      font-weight: 620;
+    }
+    #status { margin: 0; color: #4e5a56; }
+    button {
+      appearance: none;
+      border: 1px solid var(--ink);
+      background: #fff;
+      color: var(--ink);
+      font: 620 1rem/1 "Source Sans 3", sans-serif;
+      padding: 12px 14px;
+      cursor: pointer;
+    }
+    button:focus-visible { outline: 2px solid var(--path); outline-offset: 2px; }
+    button.quiet {
+      border-color: transparent;
+      background: transparent;
+      color: #4e5a56;
+      padding: 12px 8px;
+    }
+    button[aria-pressed="true"] {
+      background: var(--ink);
+      color: #fff;
+    }
+    #map { height: 100%; background: #e4e8e6; }
+    .num {
+      background: #fff;
+      color: var(--ink);
+      border: 1px solid var(--ink);
+      font: 620 13px/1 "Source Sans 3", sans-serif;
+      padding: 2px 3px;
+      white-space: nowrap;
+    }
+    .num.called {
+      background: #e6ebe8;
+      color: #8b968f;
+      border-color: #c5cdc8;
+    }
+    .num.target {
+      background: #c45c12;
+      color: #fff;
+      border-color: #8a3c08;
+    }
+    .here {
+      width: 18px;
+      height: 18px;
+      margin-left: -9px;
+      margin-top: -9px;
+      border-radius: 50%;
+      background: var(--here);
+      border: 3px solid #fff;
+      box-shadow: 0 0 0 1px rgba(11, 107, 74, 0.45);
+    }
+    .leaflet-tooltip { padding: 2px 6px; font-family: "Source Sans 3", sans-serif; }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>R116</h1>
+    <p id="left">Douglas</p>
+  </header>
+  <div id="map"></div>
+  <footer>
+    <button type="button" id="where">Where I am</button>
+    <button type="button" id="trace-back" aria-pressed="false">Trace back</button>
+    <p id="status">Finding you</p>
+    <button type="button" class="quiet" id="clear">Clear this round</button>
+  </footer>
+  <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+  <script src="houses.js"></script>
+  <script>
+    window.addEventListener("error", (event) => {
+      const el = document.getElementById("status");
+      if (el) el.textContent = event.message;
+    });
+    const TRACE_KEY = "r116-trace";
+    const CALLED_KEY = "r116-called";
+    const houses = (window.HOUSES && window.HOUSES.houses) || [];
+
+    const map = L.map("map", { zoomControl: false });
+    L.control.zoom({ position: "bottomright" }).addTo(map);
+    L.tileLayer("https://tile.openstreetmap.org/{z}/{x}/{y}.png", {
+      maxZoom: 20,
+      attribution: "&copy; OpenStreetMap"
+    }).addTo(map);
+
+    const leftEl = document.getElementById("left");
+    const statusEl = document.getElementById("status");
+    const whereBtn = document.getElementById("where");
+    const traceBtn = document.getElementById("trace-back");
+    const clearBtn = document.getElementById("clear");
+
+    function houseId(house) {
+      return house.n + "|" + house.lat.toFixed(5) + "|" + house.lon.toFixed(5);
+    }
+
+    const called = new Set(JSON.parse(localStorage.getItem(CALLED_KEY) || "[]"));
+    let tracePts = JSON.parse(localStorage.getItem(TRACE_KEY) || "[]");
+    let follow = false;
+    let jumpOnNext = false;
+    let watchId = null;
+    let hereMarker = null;
+    let hereCircle = null;
+    let clearArmed = false;
+    let picking = false;
+    let backHouse = null;
+
+    const trace = L.polyline(tracePts, {
+      color: "#123a73",
+      weight: 5,
+      opacity: 0.9
+    }).addTo(map);
+    const backLine = L.polyline([], {
+      color: "#c45c12",
+      weight: 6,
+      opacity: 0.95
+    }).addTo(map);
+
+    function metres(aLat, aLon, bLat, bLon) {
+      const x = (aLon - bLon) * Math.cos(aLat * Math.PI / 180) * 111320;
+      const y = (aLat - bLat) * 111320;
+      return Math.hypot(x, y);
+    }
+
+    function saveCalled() {
+      localStorage.setItem(CALLED_KEY, JSON.stringify([...called]));
+    }
+
+    function saveTrace() {
+      localStorage.setItem(TRACE_KEY, JSON.stringify(tracePts));
+    }
+
+    function stillToCall() {
+      return houses.filter((house) => !called.has(houseId(house))).length;
+    }
+
+    function showLeft() {
+      const left = stillToCall();
+      leftEl.textContent = houses.length
+        ? left + " still to call"
+        : "No houses yet";
+    }
+
+    function paint(house) {
+      if (!house.el) return;
+      house.el.classList.toggle("called", called.has(houseId(house)) && house !== backHouse);
+      house.el.classList.toggle("target", house === backHouse);
+    }
+
+    function stopTracing() {
+      picking = false;
+      backHouse = null;
+      backLine.setLatLngs([]);
+      traceBtn.setAttribute("aria-pressed", "false");
+      traceBtn.textContent = "Trace back";
+      houses.forEach(paint);
+    }
+
+    const bounds = houses.map((house) => [house.lat, house.lon]);
+    if (bounds.length) map.fitBounds(bounds, { padding: [28, 28] });
+    else map.setView([51.8782, -8.4192], 17);
+
+    houses.forEach((house) => {
+      const icon = L.divIcon({
+        className: "",
+        html: `<span class="num">${house.n}</span>`
+      });
+      const marker = L.marker([house.lat, house.lon], {
+        icon,
+        title: house.n + " " + house.street,
+        zIndexOffset: called.has(houseId(house)) ? 0 : 400
+      }).addTo(map);
+      house.el = marker.getElement().querySelector(".num");
+      paint(house);
+      marker.bindTooltip(house.n + " " + house.street, { direction: "top", offset: [0, -8] });
+      marker.on("click", () => {
+        if (picking) {
+          goBackTo(house);
+          return;
+        }
+        const id = houseId(house);
+        if (called.has(id)) called.delete(id);
+        else called.add(id);
+        paint(house);
+        saveCalled();
+        showLeft();
+      });
+    });
+
+    showLeft();
+
+    function showHere(lat, lon, accuracy) {
+      const latlng = [lat, lon];
+      const radius = Math.max(accuracy || 12, 8);
+      if (!hereMarker) {
+        hereCircle = L.circle(latlng, {
+          radius,
+          color: "#0b6b4a",
+          weight: 1,
+          fillColor: "#0b6b4a",
+          fillOpacity: 0.12,
+          interactive: false
+        }).addTo(map);
+        hereMarker = L.marker(latlng, {
+          icon: L.divIcon({ className: "", html: '<div class="here"></div>', iconSize: [18, 18] }),
+          zIndexOffset: 1000,
+          interactive: false,
+          keyboard: false
+        }).addTo(map);
+      } else {
+        hereMarker.setLatLng(latlng);
+        hereCircle.setLatLng(latlng);
+        hereCircle.setRadius(radius);
+      }
+    }
+
+    function markPassed(lat, lon, accuracy) {
+      if (accuracy > 25) return;
+      let changed = false;
+      houses.forEach((house) => {
+        const id = houseId(house);
+        if (called.has(id)) return;
+        if (metres(lat, lon, house.lat, house.lon) <= 18) {
+          called.add(id);
+          paint(house);
+          changed = true;
+        }
+      });
+      if (changed) {
+        saveCalled();
+        showLeft();
+      }
+    }
+
+    function addTrace(lat, lon, accuracy) {
+      if (accuracy > 35) return;
+      const last = tracePts[tracePts.length - 1];
+      if (last && metres(lat, lon, last[0], last[1]) < 4) return;
+      tracePts.push([lat, lon]);
+      trace.setLatLngs(tracePts);
+      saveTrace();
+    }
+
+    function onPosition(pos) {
+      const lat = pos.coords.latitude;
+      const lon = pos.coords.longitude;
+      const accuracy = pos.coords.accuracy || 0;
+      showHere(lat, lon, accuracy);
+      addTrace(lat, lon, accuracy);
+      markPassed(lat, lon, accuracy);
+      if (jumpOnNext) {
+        map.setView([lat, lon], Math.max(map.getZoom(), 18));
+        jumpOnNext = false;
+      } else if (follow) {
+        map.panTo([lat, lon]);
+      }
+      if (!picking && !backHouse) {
+        statusEl.textContent = accuracy > 30
+          ? "Location is rough"
+          : "You are here";
+      }
+    }
+
+    function onLocateError(err) {
+      statusEl.textContent = err && err.code === 1
+        ? "Allow location to see where you are"
+        : "Location is not available";
+    }
+
+    function startWatch(jump) {
+      if (!navigator.geolocation) {
+        statusEl.textContent = "This phone has no location";
+        return;
+      }
+      if (jump) {
+        follow = true;
+        jumpOnNext = true;
+        if (hereMarker) {
+          map.setView(hereMarker.getLatLng(), Math.max(map.getZoom(), 18));
+          jumpOnNext = false;
+        }
+      }
+      if (watchId != null) return;
+      statusEl.textContent = "Finding you";
+      watchId = navigator.geolocation.watchPosition(onPosition, onLocateError, {
+        enableHighAccuracy: true,
+        maximumAge: 2000,
+        timeout: 20000
+      });
+    }
+
+    map.on("dragstart", () => {
+      follow = false;
+      if (hereMarker) statusEl.textContent = "Looking around";
+    });
+
+    async function goBackTo(house) {
+      if (!hereMarker) {
+        statusEl.textContent = "Still finding you";
+        startWatch(false);
+        return;
+      }
+      picking = false;
+      backHouse = house;
+      houses.forEach(paint);
+      traceBtn.setAttribute("aria-pressed", "false");
+      traceBtn.textContent = "Stop tracing";
+      follow = false;
+      const here = hereMarker.getLatLng();
+      statusEl.textContent = "Tracing back to " + house.n;
+      const url = "https://router.project-osrm.org/route/v1/foot/"
+        + here.lng + "," + here.lat + ";" + house.lon + "," + house.lat
+        + "?overview=full&geometries=geojson";
+      let line = [[here.lat, here.lng], [house.lat, house.lon]];
+      let label = "Straight line back to " + house.n + " " + house.street;
+      try {
+        const response = await fetch(url);
+        const data = await response.json();
+        const route = data.routes && data.routes[0];
+        if (route && route.geometry) {
+          line = route.geometry.coordinates.map((pair) => [pair[1], pair[0]]);
+          const minutes = Math.max(1, Math.round(route.duration / 60));
+          label = "Back to " + house.n + " " + house.street + ", about " + minutes + " min";
+        }
+      } catch (err) {
+        label = "Straight line back to " + house.n + " " + house.street;
+      }
+      if (backHouse !== house) return;
+      backLine.setLatLngs(line);
+      map.fitBounds(backLine.getBounds(), { padding: [36, 36] });
+      statusEl.textContent = label;
+    }
+
+    whereBtn.addEventListener("click", () => startWatch(true));
+
+    traceBtn.addEventListener("click", () => {
+      if (backHouse) {
+        stopTracing();
+        statusEl.textContent = hereMarker ? "You are here" : "Finding you";
+        return;
+      }
+      picking = !picking;
+      traceBtn.setAttribute("aria-pressed", picking ? "true" : "false");
+      traceBtn.textContent = picking ? "Tap a house" : "Trace back";
+      statusEl.textContent = picking
+        ? "Tap the house to go back to"
+        : (hereMarker ? "You are here" : "Finding you");
+    });
+
+    clearBtn.addEventListener("click", () => {
+      if (!clearArmed) {
+        clearArmed = true;
+        clearBtn.textContent = "Tap again to clear";
+        setTimeout(() => {
+          clearArmed = false;
+          clearBtn.textContent = "Clear this round";
+        }, 2500);
+        return;
+      }
+      clearArmed = false;
+      clearBtn.textContent = "Clear this round";
+      tracePts = [];
+      trace.setLatLngs([]);
+      stopTracing();
+      called.clear();
+      houses.forEach(paint);
+      saveTrace();
+      saveCalled();
+      showLeft();
+    });
+
+    if (navigator.geolocation) startWatch(false);
+  </script>
+</body>
+</html>
