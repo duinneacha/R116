@@ -34,7 +34,10 @@
       padding: 10px 14px;
       background: var(--paper);
     }
-    header { border-bottom: 1px solid var(--line); }
+    header {
+      border-bottom: 1px solid var(--line);
+      flex-wrap: wrap;
+    }
     footer {
       flex-wrap: wrap;
       border-top: 1px solid var(--line);
@@ -46,10 +49,16 @@
       font-size: 1.25rem;
       font-weight: 620;
     }
-    #left {
+    .summary { text-align: right; }
+    #left, #clock {
       margin: 0;
       font-size: 1.15rem;
       font-weight: 620;
+    }
+    #clock {
+      font-size: 0.95rem;
+      font-weight: 420;
+      color: #4e5a56;
     }
     #status { margin: 0; color: #4e5a56; }
     button {
@@ -102,14 +111,61 @@
       box-shadow: 0 0 0 1px rgba(11, 107, 74, 0.45);
     }
     .leaflet-tooltip { padding: 2px 6px; font-family: "Source Sans 3", sans-serif; }
+    #progress-sheet {
+      position: fixed;
+      left: 0;
+      right: 0;
+      bottom: 0;
+      z-index: 1000;
+      max-height: min(72dvh, 560px);
+      overflow: auto;
+      background: #fff;
+      border-top: 1px solid var(--ink);
+      padding: 12px 14px calc(16px + env(safe-area-inset-bottom));
+      box-shadow: 0 -10px 28px rgba(28, 36, 48, 0.16);
+    }
+    #progress-sheet h2 {
+      margin: 0 0 10px;
+      font-size: 1.25rem;
+    }
+    #progress-sheet .top-row {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 12px;
+    }
+    .week-name {
+      margin: 14px 0 0;
+      font-weight: 620;
+    }
+    .day {
+      padding: 10px 0;
+      border-top: 1px solid var(--line);
+    }
+    .day strong { display: block; }
+    .day p, .empty-note {
+      margin: 2px 0 0;
+      color: #4e5a56;
+    }
   </style>
 </head>
 <body>
   <header>
     <h1>R116</h1>
-    <p id="left">Douglas</p>
+    <button type="button" id="progress">Progress</button>
+    <div class="summary">
+      <p id="left">Douglas</p>
+      <p id="clock" hidden></p>
+    </div>
   </header>
   <div id="map"></div>
+  <section id="progress-sheet" hidden>
+    <div class="top-row">
+      <h2>Progress</h2>
+      <button type="button" id="progress-close">Close</button>
+    </div>
+    <div id="progress-body"></div>
+  </section>
   <footer>
     <button type="button" id="where">Where I am</button>
     <button type="button" id="trace-back" aria-pressed="false">Trace back</button>
@@ -117,7 +173,7 @@
     <button type="button" class="quiet" id="clear">Clear this round</button>
   </footer>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
-  <script src="houses.js"></script>
+  <script src="houses.js?v=3"></script>
   <script>
     window.addEventListener("error", (event) => {
       const el = document.getElementById("status");
@@ -125,6 +181,10 @@
     });
     const TRACE_KEY = "r116-trace";
     const CALLED_KEY = "r116-called";
+    const HISTORY_KEY = "r116-days";
+    const ROUND_KEY = "r116-round";
+    const LEGACY_FLAG = "r116-legacy-filed";
+    const BREAK_MS = 8 * 60 * 1000;
     const houses = (window.HOUSES && window.HOUSES.houses) || [];
 
     const map = L.map("map", { zoomControl: false });
@@ -144,8 +204,21 @@
       return house.n + "|" + house.lat.toFixed(5) + "|" + house.lon.toFixed(5);
     }
 
-    const called = new Set(JSON.parse(localStorage.getItem(CALLED_KEY) || "[]"));
-    let tracePts = JSON.parse(localStorage.getItem(TRACE_KEY) || "[]");
+    function readJson(key, fallback) {
+      try {
+        const raw = localStorage.getItem(key);
+        if (!raw) return fallback;
+        return JSON.parse(raw);
+      } catch (err) {
+        return fallback;
+      }
+    }
+
+    const called = new Set(readJson(CALLED_KEY, []));
+    let tracePts = readJson(TRACE_KEY, []);
+    let days = readJson(HISTORY_KEY, []);
+    let round = readJson(ROUND_KEY, null);
+    let filedNote = "";
     let follow = false;
     let jumpOnNext = false;
     let watchId = null;
@@ -160,6 +233,210 @@
       weight: 5,
       opacity: 0.9
     }).addTo(map);
+
+    function saveDays() {
+      localStorage.setItem(HISTORY_KEY, JSON.stringify(days));
+    }
+
+    function saveRound() {
+      if (round) localStorage.setItem(ROUND_KEY, JSON.stringify(round));
+      else localStorage.removeItem(ROUND_KEY);
+    }
+
+    function pad(n) {
+      return String(n).padStart(2, "0");
+    }
+
+    function dateOf(ms) {
+      const dt = new Date(ms);
+      return dt.getFullYear() + "-" + pad(dt.getMonth() + 1) + "-" + pad(dt.getDate());
+    }
+
+    function labelDate(iso) {
+      const parts = iso.split("-").map(Number);
+      const dt = new Date(parts[0], parts[1] - 1, parts[2]);
+      return dt.toLocaleDateString("en-IE", { weekday: "short", day: "numeric", month: "short" });
+    }
+
+    function weekStart(iso) {
+      const parts = iso.split("-").map(Number);
+      const dt = new Date(parts[0], parts[1] - 1, parts[2]);
+      const mondayOffset = (dt.getDay() + 6) % 7;
+      dt.setDate(dt.getDate() - mondayOffset);
+      return dateOf(dt.getTime());
+    }
+
+    function pathMetres(pts) {
+      let total = 0;
+      for (let i = 1; i < pts.length; i++) {
+        const gap = metres(pts[i - 1][0], pts[i - 1][1], pts[i][0], pts[i][1]);
+        if (gap < 2000) total += gap;
+      }
+      return total;
+    }
+
+    function roundDuration(now) {
+      if (!round || !round.startedAt) return 0;
+      const marks = [round.startedAt];
+      tracePts.forEach((point) => {
+        if (point[2]) marks.push(point[2]);
+      });
+      marks.sort((a, b) => a - b);
+      const last = marks[marks.length - 1];
+      if (document.visibilityState !== "hidden" || now - last < 30000) marks.push(now);
+      let total = 0;
+      for (let i = 1; i < marks.length; i++) {
+        const gap = marks[i] - marks[i - 1];
+        if (gap <= 0) continue;
+        if (gap <= BREAK_MS) total += gap;
+        else if (i === marks.length - 1) total += BREAK_MS;
+      }
+      return total;
+    }
+
+    function formatDuration(ms) {
+      if (ms == null) return "Time not recorded";
+      const mins = Math.max(0, Math.round(ms / 60000));
+      const hours = Math.floor(mins / 60);
+      const rest = mins % 60;
+      if (hours <= 0) return mins + " min";
+      return hours + "h " + pad(rest) + "m";
+    }
+
+    function formatDistance(metresOut) {
+      if (metresOut < 1000) return Math.round(metresOut) + " m";
+      return (metresOut / 1000).toFixed(1) + " km";
+    }
+
+    function formatPace(ms, count) {
+      if (ms == null || !count) return "";
+      const secs = Math.round(ms / count / 1000);
+      if (secs < 90) return "about " + secs + "s each";
+      const mins = secs / 60;
+      return "about " + mins.toFixed(1) + " min each";
+    }
+
+    function statLine(day) {
+      const bits = [formatDuration(day.durationMs), formatDistance(day.distanceM), day.called + " houses"];
+      const pace = formatPace(day.durationMs, day.called);
+      if (pace) bits.push(pace);
+      return bits.join(" · ");
+    }
+
+    function ensureRound() {
+      if (round && round.startedAt) return;
+      round = { startedAt: Date.now() };
+      saveRound();
+      showClock();
+    }
+
+    function showClock() {
+      const clock = document.getElementById("clock");
+      if (round && round.startedAt) {
+        clock.hidden = false;
+        clock.textContent = formatDuration(roundDuration(Date.now()));
+        return;
+      }
+      if (filedNote) {
+        clock.hidden = false;
+        clock.textContent = filedNote;
+        return;
+      }
+      clock.hidden = true;
+      clock.textContent = "";
+    }
+
+    function liveDay() {
+      if (!round || !round.startedAt) return null;
+      if (called.size === 0 && pathMetres(tracePts) < 80) return null;
+      return {
+        date: dateOf(round.startedAt),
+        durationMs: roundDuration(Date.now()),
+        called: called.size,
+        total: houses.length,
+        distanceM: Math.round(pathMetres(tracePts)),
+        live: true
+      };
+    }
+
+    function sumDays(list) {
+      return list.reduce((sum, day) => {
+        sum.called += day.called || 0;
+        sum.distanceM += day.distanceM || 0;
+        if (day.durationMs == null) sum.missingTime = true;
+        else sum.durationMs += day.durationMs;
+        return sum;
+      }, { called: 0, distanceM: 0, durationMs: 0, missingTime: false });
+    }
+
+    function renderProgress() {
+      const body = document.getElementById("progress-body");
+      const current = liveDay();
+      const finished = days.slice().sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0) || b.date.localeCompare(a.date));
+      if (!current && !finished.length) {
+        body.innerHTML = '<p class="empty-note">Nothing saved yet. The clock starts when you move off. Clear this round when you finish, and the day is kept.</p>';
+        return;
+      }
+      const blocks = [];
+      if (current) {
+        blocks.push('<p class="week-name">This round</p><div class="day"><strong>' + labelDate(current.date) + ', in progress</strong><p>' + statLine(current) + '</p></div>');
+      }
+      const thisWeek = weekStart(dateOf(Date.now()));
+      const lastWeekDate = new Date();
+      lastWeekDate.setDate(lastWeekDate.getDate() - 7);
+      const lastWeek = weekStart(dateOf(lastWeekDate.getTime()));
+      [{ key: thisWeek, title: "This week" }, { key: lastWeek, title: "Last week" }].forEach((week) => {
+        const rows = finished.filter((day) => weekStart(day.date) === week.key);
+        const extra = current && weekStart(current.date) === week.key ? [current] : [];
+        const all = rows.concat(extra);
+        if (!all.length) return;
+        const sum = sumDays(all);
+        const summary = statLine({
+          durationMs: sum.missingTime && sum.durationMs === 0 ? null : sum.durationMs,
+          distanceM: sum.distanceM,
+          called: sum.missingTime ? 0 : sum.called
+        }).replace(/ · 0 houses$/, " · " + sum.called + " houses");
+        const lines = rows.map((day) => '<div class="day"><strong>' + labelDate(day.date) + '</strong><p>' + statLine(day) + '</p></div>').join("");
+        blocks.push('<p class="week-name">' + week.title + '</p><div class="day"><strong>Total</strong><p>' + summary + '</p></div>' + lines);
+      });
+      const older = finished.filter((day) => {
+        const key = weekStart(day.date);
+        return key !== thisWeek && key !== lastWeek;
+      });
+      if (older.length) {
+        blocks.push('<p class="week-name">Earlier</p>' + older.map((day) => '<div class="day"><strong>' + labelDate(day.date) + '</strong><p>' + statLine(day) + '</p></div>').join(""));
+      }
+      body.innerHTML = blocks.join("");
+    }
+
+    function fileLegacyRound() {
+      if (localStorage.getItem(LEGACY_FLAG)) return;
+      const distance = pathMetres(tracePts);
+      if (called.size === 0 && distance < 80) {
+        localStorage.setItem(LEGACY_FLAG, "1");
+        return;
+      }
+      days.push({
+        date: "2026-10-06",
+        startedAt: null,
+        finishedAt: Date.parse("2026-10-06T18:00:00"),
+        durationMs: null,
+        called: called.size,
+        total: houses.filter((house) => house.street !== "Newlyn Vale").length,
+        distanceM: Math.round(distance),
+        legacy: true
+      });
+      saveDays();
+      called.clear();
+      tracePts = [];
+      trace.setLatLngs([]);
+      saveCalled();
+      saveTrace();
+      localStorage.setItem(LEGACY_FLAG, "1");
+      filedNote = "Tue 6 Oct saved. Time was not recorded.";
+    }
+
+    fileLegacyRound();
     const backLine = L.polyline([], {
       color: "#c45c12",
       weight: 6,
@@ -230,7 +507,10 @@
         }
         const id = houseId(house);
         if (called.has(id)) called.delete(id);
-        else called.add(id);
+        else {
+          called.add(id);
+          ensureRound();
+        }
         paint(house);
         saveCalled();
         showLeft();
@@ -277,6 +557,7 @@
         }
       });
       if (changed) {
+        ensureRound();
         saveCalled();
         showLeft();
       }
@@ -286,7 +567,8 @@
       if (accuracy > 35) return;
       const last = tracePts[tracePts.length - 1];
       if (last && metres(lat, lon, last[0], last[1]) < 4) return;
-      tracePts.push([lat, lon]);
+      ensureRound();
+      tracePts.push([lat, lon, Date.now()]);
       trace.setLatLngs(tracePts);
       saveTrace();
     }
@@ -409,15 +691,48 @@
       }
       clearArmed = false;
       clearBtn.textContent = "Clear this round";
+      const distance = pathMetres(tracePts);
+      const worthSaving = called.size > 0 || distance >= 80;
+      if (worthSaving) {
+        const when = round && round.startedAt ? round.startedAt : Date.now();
+        days.push({
+          date: dateOf(when),
+          startedAt: round && round.startedAt || null,
+          finishedAt: Date.now(),
+          durationMs: round && round.startedAt ? roundDuration(Date.now()) : null,
+          called: called.size,
+          total: houses.length,
+          distanceM: Math.round(distance),
+          legacy: false
+        });
+        saveDays();
+        statusEl.textContent = "Round saved";
+      }
       tracePts = [];
       trace.setLatLngs([]);
       stopTracing();
       called.clear();
+      round = null;
+      filedNote = "";
       houses.forEach(paint);
       saveTrace();
       saveCalled();
+      saveRound();
       showLeft();
+      showClock();
     });
+
+    const progressBtn = document.getElementById("progress");
+    const progressSheet = document.getElementById("progress-sheet");
+    function setProgress(open) {
+      progressSheet.hidden = !open;
+      progressBtn.setAttribute("aria-expanded", open ? "true" : "false");
+      if (open) renderProgress();
+    }
+    progressBtn.addEventListener("click", () => setProgress(progressSheet.hidden));
+    document.getElementById("progress-close").addEventListener("click", () => setProgress(false));
+    showClock();
+    setInterval(showClock, 15000);
 
     if (navigator.geolocation) startWatch(false);
   </script>
