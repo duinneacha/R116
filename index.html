@@ -100,6 +100,40 @@
       color: #fff;
       border-color: #8a3c08;
     }
+    .num.nearby {
+      box-shadow: 0 0 0 3px #0b6b4a;
+    }
+    .num.flagged {
+      border-color: #8a3c08;
+      box-shadow: inset 0 -3px 0 #c45c12;
+    }
+    .num.dimmed { opacity: 0.25; }
+    .sheet-actions {
+      display: grid;
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .sheet-actions button,
+    #find-sheet select,
+    #find-sheet input,
+    #address-suggest {
+      width: 100%;
+      min-height: 48px;
+      font-size: 1.05rem;
+    }
+    #find-sheet select,
+    #find-sheet input,
+    #address-suggest {
+      border: 1px solid var(--ink);
+      padding: 10px 12px;
+      font-family: inherit;
+    }
+    #address-meta, #address-warn, #find-results p {
+      margin: 8px 0 0;
+      color: #4e5a56;
+    }
+    #find-results { display: grid; gap: 8px; margin-top: 8px; }
+    #find-results button { min-height: 48px; }
     .here {
       width: 18px;
       height: 18px;
@@ -111,6 +145,7 @@
       box-shadow: 0 0 0 1px rgba(11, 107, 74, 0.45);
     }
     .leaflet-tooltip { padding: 2px 6px; font-family: "Source Sans 3", sans-serif; }
+    .sheet,
     #progress-sheet {
       position: fixed;
       left: 0;
@@ -124,6 +159,7 @@
       padding: 12px 14px calc(16px + env(safe-area-inset-bottom));
       box-shadow: 0 -10px 28px rgba(28, 36, 48, 0.16);
     }
+    .sheet h2,
     #progress-sheet h2 {
       margin: 0 0 10px;
       font-size: 1.25rem;
@@ -166,14 +202,45 @@
     </div>
     <div id="progress-body"></div>
   </section>
+  <section id="address-sheet" class="sheet" hidden>
+    <div class="top-row">
+      <h2 id="address-title">House</h2>
+      <button type="button" id="address-close">Close</button>
+    </div>
+    <p id="address-meta"></p>
+    <p id="address-warn"></p>
+    <div class="sheet-actions">
+      <button type="button" id="address-wrong-number">Wrong number</button>
+      <button type="button" id="address-wrong-place">Wrong place</button>
+      <button type="button" id="address-checked">I checked this door</button>
+      <input id="address-suggest" hidden placeholder="Number on the door" inputmode="text" autocomplete="off">
+      <button type="button" id="address-save" hidden>Save suggestion</button>
+    </div>
+  </section>
+  <section id="find-sheet" class="sheet" hidden>
+    <div class="top-row">
+      <h2>Find a house</h2>
+      <button type="button" id="find-close">Close</button>
+    </div>
+    <div class="sheet-actions">
+      <select id="find-street"></select>
+      <input id="find-number" placeholder="House number" inputmode="text" autocomplete="off">
+      <button type="button" id="find-go">Show on map</button>
+      <button type="button" id="find-problems" aria-pressed="false">Problems only</button>
+    </div>
+    <div id="find-results"></div>
+  </section>
   <footer>
     <button type="button" id="where">Where I am</button>
     <button type="button" id="trace-back" aria-pressed="false">Trace back</button>
+    <button type="button" id="find">Find</button>
+    <button type="button" id="check" aria-pressed="false">Check</button>
     <p id="status">Finding you</p>
     <button type="button" class="quiet" id="clear">Clear this round</button>
   </footer>
   <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
   <script src="houses.js?v=5"></script>
+  <script src="audit-flags.js?v=1"></script>
   <script>
     window.addEventListener("error", (event) => {
       const el = document.getElementById("status");
@@ -184,6 +251,8 @@
     const HISTORY_KEY = "r116-days";
     const ROUND_KEY = "r116-round";
     const LEGACY_FLAG = "r116-legacy-filed";
+    const CORRECTIONS_KEY = "r116-corrections";
+    const CHECKS_KEY = "r116-checks";
     const BREAK_MS = 8 * 60 * 1000;
     const houses = (window.HOUSES && window.HOUSES.houses) || [];
 
@@ -227,6 +296,11 @@
     let clearArmed = false;
     let picking = false;
     let backHouse = null;
+    let checking = false;
+    let problemsOnly = false;
+    let addressHouse = null;
+    let suggestKind = null;
+    const flags = new Set((window.AUDIT_FLAGS || []).map((item) => item.id));
 
     const trace = L.polyline(tracePts, {
       color: "#123a73",
@@ -369,12 +443,29 @@
       }, { called: 0, distanceM: 0, durationMs: 0, missingTime: false });
     }
 
+    function escapeText(value) {
+      return String(value == null ? "" : value).replace(/&/g, "&amp;").replace(/</g, "&lt;");
+    }
+
+    function correctionNote() {
+      const notes = readJson(CORRECTIONS_KEY, []);
+      if (!notes.length) return "";
+      const lines = notes.slice(-8).reverse().map((note) => {
+        const detail = note.kind === "number"
+          ? "Suggested number " + escapeText(note.suggestion || "")
+          : "Suggested position, accuracy " + (note.accuracy == null ? "unknown" : Math.round(note.accuracy) + " m");
+        return '<div class="day"><strong>' + escapeText(note.n) + " " + escapeText(note.street) + '</strong><p>' + detail + ". " + escapeText(note.status) + ". The pin is unchanged.</p></div>";
+      }).join("");
+      return '<p class="week-name">Address suggestions</p>' + lines;
+    }
+
     function renderProgress() {
       const body = document.getElementById("progress-body");
       const current = liveDay();
       const finished = days.slice().sort((a, b) => (b.finishedAt || 0) - (a.finishedAt || 0) || b.date.localeCompare(a.date));
+      const notes = correctionNote();
       if (!current && !finished.length) {
-        body.innerHTML = '<p class="empty-note">Nothing saved yet. The clock starts when you move off. Clear this round when you finish, and the day is kept.</p>';
+        body.innerHTML = notes + '<p class="empty-note">Nothing saved yet. The clock starts when you move off. Clear this round when you finish, and the day is kept.</p>';
         return;
       }
       const blocks = [];
@@ -406,7 +497,7 @@
       if (older.length) {
         blocks.push('<p class="week-name">Earlier</p>' + older.map((day) => '<div class="day"><strong>' + labelDate(day.date) + '</strong><p>' + statLine(day) + '</p></div>').join(""));
       }
-      body.innerHTML = blocks.join("");
+      body.innerHTML = notes + blocks.join("");
     }
 
     function fileLegacyRound() {
@@ -470,8 +561,11 @@
 
     function paint(house) {
       if (!house.el) return;
-      house.el.classList.toggle("called", called.has(houseId(house)) && house !== backHouse);
+      const id = houseId(house);
+      house.el.classList.toggle("called", called.has(id) && house !== backHouse);
       house.el.classList.toggle("target", house === backHouse);
+      house.el.classList.toggle("flagged", flags.has(id));
+      house.el.classList.toggle("dimmed", problemsOnly && !flags.has(id));
     }
 
     function stopTracing() {
@@ -503,6 +597,10 @@
       marker.on("click", () => {
         if (picking) {
           goBackTo(house);
+          return;
+        }
+        if (checking) {
+          openAddress(house);
           return;
         }
         const id = houseId(house);
@@ -544,23 +642,18 @@
       }
     }
 
-    function markPassed(lat, lon, accuracy) {
-      if (accuracy > 25) return;
-      let changed = false;
+    function markNearby(lat, lon, accuracy) {
+      const reliable = accuracy <= 25;
+      const names = [];
       houses.forEach((house) => {
-        const id = houseId(house);
-        if (called.has(id)) return;
-        if (metres(lat, lon, house.lat, house.lon) <= 18) {
-          called.add(id);
-          paint(house);
-          changed = true;
-        }
+        if (!house.el) return;
+        const close = reliable
+          && !called.has(houseId(house))
+          && metres(lat, lon, house.lat, house.lon) <= 18;
+        house.el.classList.toggle("nearby", close);
+        if (close) names.push(house.n + " " + house.street);
       });
-      if (changed) {
-        ensureRound();
-        saveCalled();
-        showLeft();
-      }
+      return names;
     }
 
     function addTrace(lat, lon, accuracy) {
@@ -573,23 +666,30 @@
       saveTrace();
     }
 
+    let lastFix = null;
+
     function onPosition(pos) {
       const lat = pos.coords.latitude;
       const lon = pos.coords.longitude;
       const accuracy = pos.coords.accuracy || 0;
+      lastFix = { lat, lon, accuracy };
       showHere(lat, lon, accuracy);
       addTrace(lat, lon, accuracy);
-      markPassed(lat, lon, accuracy);
+      const nearbyNames = markNearby(lat, lon, accuracy);
       if (jumpOnNext) {
         map.setView([lat, lon], Math.max(map.getZoom(), 18));
         jumpOnNext = false;
       } else if (follow) {
         map.panTo([lat, lon]);
       }
-      if (!picking && !backHouse) {
-        statusEl.textContent = accuracy > 30
-          ? "Location is rough"
-          : "You are here";
+      if (!picking && !backHouse && addressHouse == null) {
+        if (nearbyNames.length) {
+          statusEl.textContent = "Near " + nearbyNames.slice(0, 2).join(", ") + ". Not delivered.";
+        } else {
+          statusEl.textContent = accuracy > 30
+            ? "Location is rough"
+            : "You are here";
+        }
       }
     }
 
@@ -662,6 +762,166 @@
       map.fitBounds(backLine.getBounds(), { padding: [36, 36] });
       statusEl.textContent = label;
     }
+
+    const addressSheet = document.getElementById("address-sheet");
+    const addressTitle = document.getElementById("address-title");
+    const addressMeta = document.getElementById("address-meta");
+    const addressWarn = document.getElementById("address-warn");
+    const suggestInput = document.getElementById("address-suggest");
+    const saveSuggest = document.getElementById("address-save");
+    const findSheet = document.getElementById("find-sheet");
+    const findStreet = document.getElementById("find-street");
+    const findNumber = document.getElementById("find-number");
+    const findResults = document.getElementById("find-results");
+    const checkBtn = document.getElementById("check");
+    const problemsBtn = document.getElementById("find-problems");
+
+    [...new Set(houses.map((house) => house.street))].sort().forEach((street) => {
+      const option = document.createElement("option");
+      option.value = street;
+      option.textContent = street;
+      findStreet.appendChild(option);
+    });
+
+    function otherCopies(house) {
+      return houses.filter((other) => other !== house && other.street === house.street && other.n === house.n);
+    }
+
+    function openAddress(house) {
+      addressHouse = house;
+      suggestKind = null;
+      suggestInput.hidden = true;
+      saveSuggest.hidden = true;
+      suggestInput.value = "";
+      addressTitle.textContent = house.n + " " + house.street;
+      addressMeta.textContent = house.lat.toFixed(7) + ", " + house.lon.toFixed(7);
+      const copies = otherCopies(house);
+      addressWarn.textContent = copies.length
+        ? "Another " + house.n + " on " + house.street + " is " + Math.round(metres(house.lat, house.lon, copies[0].lat, copies[0].lon)) + " m away."
+        : "";
+      addressSheet.hidden = false;
+      checking = false;
+      checkBtn.setAttribute("aria-pressed", "false");
+      checkBtn.textContent = "Check";
+    }
+
+    function closeAddress() {
+      addressSheet.hidden = true;
+      addressHouse = null;
+      suggestKind = null;
+    }
+
+    function saveCorrection(entry) {
+      const list = readJson(CORRECTIONS_KEY, []);
+      list.push(entry);
+      localStorage.setItem(CORRECTIONS_KEY, JSON.stringify(list));
+    }
+
+    document.getElementById("address-close").addEventListener("click", closeAddress);
+    document.getElementById("address-wrong-number").addEventListener("click", () => {
+      suggestKind = "number";
+      suggestInput.hidden = false;
+      saveSuggest.hidden = false;
+      saveSuggest.textContent = "Save suggested number";
+      suggestInput.focus();
+    });
+    document.getElementById("address-wrong-place").addEventListener("click", () => {
+      suggestKind = "place";
+      suggestInput.hidden = true;
+      saveSuggest.hidden = false;
+      if (!lastFix) {
+        saveSuggest.textContent = "Turn on Where I am first";
+        addressWarn.textContent = "The suggestion is saved beside the house. The pin is not moved.";
+        return;
+      }
+      const rough = lastFix.accuracy > 25;
+      saveSuggest.textContent = rough ? "GPS is rough — save anyway" : "Save where I am standing";
+      addressWarn.textContent = "GPS accuracy " + Math.round(lastFix.accuracy) + " m. "
+        + (rough ? "That is too rough to trust. " : "")
+        + "The pin stays where it is until the list is updated.";
+    });
+    saveSuggest.addEventListener("click", () => {
+      if (!addressHouse) return;
+      if (suggestKind === "place" && !lastFix) {
+        startWatch(true);
+        return;
+      }
+      const entry = {
+        id: houseId(addressHouse),
+        street: addressHouse.street,
+        n: addressHouse.n,
+        kind: suggestKind,
+        suggestion: suggestKind === "number" ? suggestInput.value.trim() : "",
+        lat: suggestKind === "place" && lastFix ? lastFix.lat : null,
+        lon: suggestKind === "place" && lastFix ? lastFix.lon : null,
+        accuracy: suggestKind === "place" && lastFix ? lastFix.accuracy : null,
+        status: "proposed",
+        at: new Date().toISOString()
+      };
+      if (suggestKind === "number" && !entry.suggestion) return;
+      saveCorrection(entry);
+      addressWarn.textContent = "Saved as a suggestion. The house on the map is unchanged.";
+      suggestInput.hidden = true;
+      saveSuggest.hidden = true;
+    });
+    document.getElementById("address-checked").addEventListener("click", () => {
+      if (!addressHouse) return;
+      const checks = readJson(CHECKS_KEY, {});
+      checks[houseId(addressHouse)] = { status: "checked", at: new Date().toISOString() };
+      localStorage.setItem(CHECKS_KEY, JSON.stringify(checks));
+      addressWarn.textContent = "Marked checked on this phone. The published list is unchanged.";
+    });
+
+    document.getElementById("find").addEventListener("click", () => {
+      findSheet.hidden = false;
+      findResults.replaceChildren();
+    });
+    document.getElementById("find-close").addEventListener("click", () => {
+      findSheet.hidden = true;
+    });
+    document.getElementById("find-go").addEventListener("click", () => {
+      const wanted = findNumber.value.trim().toLowerCase();
+      const matches = houses.filter((house) => {
+        return house.street === findStreet.value && (!wanted || String(house.n).toLowerCase() === wanted);
+      });
+      findResults.replaceChildren();
+      if (!matches.length) {
+        const note = document.createElement("p");
+        note.textContent = "No house with that number on " + findStreet.value + ".";
+        findResults.appendChild(note);
+        return;
+      }
+      const bounds = matches.map((house) => [house.lat, house.lon]);
+      if (bounds.length === 1) map.setView(bounds[0], 19);
+      else map.fitBounds(bounds, { padding: [40, 40], maxZoom: 18 });
+      matches.forEach((house) => {
+        const button = document.createElement("button");
+        button.type = "button";
+        button.textContent = house.n + " " + house.street;
+        button.addEventListener("click", () => {
+          findSheet.hidden = true;
+          map.setView([house.lat, house.lon], 19);
+          openAddress(house);
+        });
+        findResults.appendChild(button);
+      });
+      if (matches.length === 1) findSheet.hidden = true;
+    });
+    problemsBtn.addEventListener("click", () => {
+      problemsOnly = !problemsOnly;
+      problemsBtn.setAttribute("aria-pressed", problemsOnly ? "true" : "false");
+      problemsBtn.textContent = problemsOnly ? "Show all houses" : "Problems only";
+      houses.forEach(paint);
+    });
+    checkBtn.addEventListener("click", () => {
+      checking = !checking;
+      picking = false;
+      traceBtn.setAttribute("aria-pressed", "false");
+      traceBtn.textContent = "Trace back";
+      checkBtn.setAttribute("aria-pressed", checking ? "true" : "false");
+      checkBtn.textContent = checking ? "Tap a house" : "Check";
+      statusEl.textContent = checking ? "Tap the house to check" : (hereMarker ? "You are here" : "Finding you");
+    });
 
     whereBtn.addEventListener("click", () => startWatch(true));
 
